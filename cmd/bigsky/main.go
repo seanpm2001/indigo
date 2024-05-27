@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -23,12 +25,9 @@ import (
 	"github.com/bluesky-social/indigo/util"
 	"github.com/bluesky-social/indigo/util/cliutil"
 	"github.com/bluesky-social/indigo/xrpc"
-	_ "go.uber.org/automaxprocs"
-
-	"net/http"
-	_ "net/http/pprof"
 
 	_ "github.com/joho/godotenv/autoload"
+	_ "go.uber.org/automaxprocs"
 
 	"github.com/carlmjohnson/versioninfo"
 	logging "github.com/ipfs/go-log"
@@ -51,13 +50,16 @@ func init() {
 }
 
 func main() {
-	run(os.Args)
+	if err := run(os.Args); err != nil {
+		log.Fatal(err)
+	}
 }
 
-func run(args []string) {
+func run(args []string) error {
+
 	app := cli.App{
 		Name:    "bigsky",
-		Usage:   "atproto BGS/firehose daemon",
+		Usage:   "atproto Relay daemon",
 		Version: versioninfo.Short(),
 	}
 
@@ -103,7 +105,7 @@ func run(args []string) {
 		&cli.BoolFlag{
 			Name:    "spidering",
 			Value:   true,
-			EnvVars: []string{"BGS_SPIDERING"},
+			EnvVars: []string{"RELAY_SPIDERING", "BGS_SPIDERING"},
 		},
 		&cli.StringFlag{
 			Name:  "api-listen",
@@ -112,7 +114,7 @@ func run(args []string) {
 		&cli.StringFlag{
 			Name:    "metrics-listen",
 			Value:   ":2471",
-			EnvVars: []string{"BGS_METRICS_LISTEN"},
+			EnvVars: []string{"RELAY_METRICS_LISTEN", "BGS_METRICS_LISTEN"},
 		},
 		&cli.StringFlag{
 			Name: "disk-blob-store",
@@ -123,7 +125,7 @@ func run(args []string) {
 		},
 		&cli.StringFlag{
 			Name:    "admin-key",
-			EnvVars: []string{"BGS_ADMIN_KEY"},
+			EnvVars: []string{"RELAY_ADMIN_KEY", "BGS_ADMIN_KEY"},
 		},
 		&cli.StringSliceFlag{
 			Name:    "handle-resolver-hosts",
@@ -141,7 +143,7 @@ func run(args []string) {
 		},
 		&cli.DurationFlag{
 			Name:    "compact-interval",
-			EnvVars: []string{"BGS_COMPACT_INTERVAL"},
+			EnvVars: []string{"RELAY_COMPACT_INTERVAL", "BGS_COMPACT_INTERVAL"},
 			Value:   4 * time.Hour,
 			Usage:   "interval between compaction runs, set to 0 to disable scheduled compaction",
 		},
@@ -159,19 +161,27 @@ func run(args []string) {
 			Value:   100,
 			EnvVars: []string{"MAX_FETCH_CONCURRENCY"},
 		},
+		&cli.StringFlag{
+			Name:    "environment",
+			EnvVars: []string{"ENVIRONMENT"},
+			Usage:   "declared hosting environment (prod, qa, etc); used in metrics",
+		},
+		&cli.StringFlag{
+			Name:    "otel-exporter-otlp-endpoint",
+			EnvVars: []string{"OTEL_EXPORTER_OTLP_ENDPOINT"},
+		},
+		&cli.StringFlag{
+			Name:    "bsky-social-rate-limit-skip",
+			EnvVars: []string{"BSKY_SOCIAL_RATE_LIMIT_SKIP"},
+			Usage:   "ratelimit bypass secret token for *.bsky.social domains",
+		},
 	}
 
-	app.Action = Bigsky
-	err := app.Run(os.Args)
-	if err != nil {
-		log.Fatal(err)
-	}
+	app.Action = runBigsky
+	return app.Run(os.Args)
 }
 
-func Bigsky(cctx *cli.Context) error {
-	// Trap SIGINT to trigger a shutdown.
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+func setupOTEL(cctx *cli.Context) error {
 
 	if cctx.Bool("jaeger") {
 		url := "http://localhost:14268/api/traces"
@@ -227,6 +237,19 @@ func Bigsky(cctx *cli.Context) error {
 			)),
 		)
 		otel.SetTracerProvider(tp)
+	}
+
+	return nil
+}
+
+func runBigsky(cctx *cli.Context) error {
+	// Trap SIGINT to trigger a shutdown.
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+
+	// start observability/tracing (OTEL and jaeger)
+	if err := setupOTEL(cctx); err != nil {
+		return err
 	}
 
 	// ensure data directory exists; won't error if it does
